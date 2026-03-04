@@ -1,0 +1,185 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+#define BUZZER_PIN 25
+
+// ========= WIFI & TELEGRAM =========
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+String BOTtoken = "YOUR_BOT_TOKEN";
+String CHAT_ID  = "CARE_GIVER_CHAT_ID";
+// ===================================
+
+MAX30105 particleSensor;
+Adafruit_MPU6050 mpu;
+
+uint32_t redBuffer[100];
+uint32_t irBuffer[100];
+
+int32_t spo2;
+int8_t validSPO2;
+int32_t heartRate;
+int8_t validHeartRate;
+
+bool fallSent = false;
+bool healthSent = false;
+unsigned long lastFallTime = 0;
+
+// ---------- TELEGRAM ----------
+void sendTelegram(String message) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient https;
+  String url = "https://api.telegram.org/bot" + BOTtoken +
+               "/sendMessage?chat_id=" + CHAT_ID +
+               "&text=" + message;
+
+  if (https.begin(client, url)) {
+    int httpCode = https.GET();
+    Serial.print("Telegram Response: ");
+    Serial.println(httpCode);
+    https.end();
+  } else {
+    Serial.println("Telegram Failed");
+  }
+}
+
+// ---------- BUZZER ----------
+void buzzerAlert() {
+  static unsigned long prev = 0;
+  static bool state = false;
+  if (millis() - prev > 300) {
+    prev = millis();
+    state = !state;
+    digitalWrite(BUZZER_PIN, state);
+  }
+}
+
+void setup() {
+
+  Serial.begin(115200);
+  Wire.begin();
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // WiFi
+  Serial.print("Connecting WiFi");
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Connected");
+  Serial.println(WiFi.localIP());
+
+  // MAX30102
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not found");
+    while (1);
+  }
+  particleSensor.setup();
+
+  // MPU6050
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found");
+    while (1);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+
+  Serial.println("System Ready");
+}
+
+void loop() {
+
+  // ================= HEALTH =================
+  long irValue = particleSensor.getIR();
+
+  if (irValue > 50000) {
+
+    for (byte i = 0; i < 100; i++) {
+      while (!particleSensor.available())
+        particleSensor.check();
+
+      redBuffer[i] = particleSensor.getRed();
+      irBuffer[i]  = particleSensor.getIR();
+      particleSensor.nextSample();
+    }
+
+    maxim_heart_rate_and_oxygen_saturation(
+      irBuffer, 100, redBuffer,
+      &spo2, &validSPO2,
+      &heartRate, &validHeartRate
+    );
+
+    if (heartRate < 45 || heartRate > 130)
+      validHeartRate = 0;
+
+    if (validHeartRate && validSPO2) {
+
+      Serial.print("BPM: ");
+      Serial.print(heartRate);
+      Serial.print(" | SpO2: ");
+      Serial.println(spo2);
+
+      if ((spo2 < 90 || heartRate > 120) && !healthSent) {
+
+        Serial.println("HEALTH ALERT");
+
+        sendTelegram(" HEALTH ALERT\nBPM: " + String(heartRate) +
+                     "\nSpO2: " + String(spo2) + "%");
+
+        healthSent = true;
+      }
+    }
+  } else {
+    healthSent = false;
+  }
+
+  // ================= FALL (DEMO IMPACT) =================
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  float magnitude = sqrt(
+    a.acceleration.x * a.acceleration.x +
+    a.acceleration.y * a.acceleration.y +
+    a.acceleration.z * a.acceleration.z) / 9.81;
+
+  Serial.print("Magnitude: ");
+  Serial.println(magnitude);
+
+  if (magnitude > 2.5 && !fallSent) {
+
+    Serial.println("FALL DETECTED");
+
+    sendTelegram("FALL DETECTED (Impact Based)");
+
+    fallSent = true;
+    lastFallTime = millis();
+  }
+
+  if (millis() - lastFallTime > 5000) {
+    fallSent = false;
+  }
+
+  // Buzzer
+  if (fallSent || healthSent) {
+    buzzerAlert();
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  delay(100);
+}
